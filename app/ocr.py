@@ -8,7 +8,7 @@ import fitz  # PyMuPDF
 from PIL import Image, ImageOps
 import pytesseract
 
-from .models import ContractExtraction
+from .models import ContractExtraction, AddOn
 
 # ---------------- Tesseract path ----------------
 pytesseract.pytesseract.tesseract_cmd = (
@@ -203,14 +203,297 @@ def _extract_labeled_date(text: str, label: str) -> Optional[datetime]:
 
 def _pick_customer_name(info_section: str) -> Optional[str]:
     """
+    Dynamic rules for customer identifier (FALLBACK for compatibility):
+    Priority:
+    1) Customer Name
+    2) Member Name (for newer format documents)
+    3) Company Name
+    4) Customer ID  (your sp_contract_print_out expects an ID-style value)
+    5) Account Number
+    """
+    for label in ["Customer Name", "Member Name", "Company Name", "Customer ID", "Account Number"]:
+        v = _extract_value_by_label(info_section, label)
+        v = _collapse_spaces(v)
+        if v:
+            # strip trailing "First Bill Date..." / "Monthly Payment Method..." if OCR merged
+            v = re.split(
+                r"(Monthly Payment Method|First Bill Date|User Name|Account Number|Phone Number|Default Voicemail Password|Address)\s*:",
+                v,
+                flags=re.IGNORECASE
+            )[0].strip()
+            if v:
+                return v
+    return None
+
+
+def _strict_extract_customer_name(info_section: str, full_text: str) -> Optional[str]:
+    """
+    STRICT: Extract ONLY from "Customer Name:" label.
+    Stop at newline or next label. Do NOT include adjacent labels.
+    """
+    # Try info section first, then full text
+    for text_source in [info_section, full_text]:
+        if not text_source:
+            continue
+            
+        # Look for exact "Customer Name:" label
+        customer_name = _extract_value_by_label(text_source, "Customer Name")
+        if customer_name:
+            # Stop at newline or next common label
+            customer_name = re.split(
+                r"(Top-Up Option|Account Number|Phone Number|Address|Monthly Payment Method|First Bill Date)\s*:",
+                customer_name,
+                flags=re.IGNORECASE
+            )[0].strip()
+            return _collapse_spaces(customer_name)
+    
+    # Fallback for compatibility with existing documents
+    return _pick_customer_name(info_section or full_text)
+
+
+def _strict_extract_activity(full_text: str) -> Optional[str]:
+    """
+    STRICT: Extract from "Activity:" label only.
+    """
+    activity = _extract_value_by_label(full_text, "Activity")
+    if activity:
+        # Clean up merged content
+        activity = re.split(r"\b(Store Phone Number|Store|Date)\s*:", activity, flags=re.IGNORECASE)[0].strip()
+        return _collapse_spaces(activity)
+    
+    # Fallback: try "Type:" for compatibility
+    type_value = _extract_value_by_label(full_text, "Type")
+    if type_value:
+        type_value = re.split(r"\b(Store Phone Number|Store|Date)\s*:", type_value, flags=re.IGNORECASE)[0].strip()
+        return _collapse_spaces(type_value)
+    
+    return None
+
+
+def _strict_extract_plan_name_and_charge(rate_section: str, full_text: str) -> Tuple[Optional[str], Optional[float]]:
+    """
+    STRICT: 
+    - Plan Name: Extract ONLY from "Plan:" label, stop at end of line
+    - Plan Charge: Extract from "Monthly Plan Charge:" label
+    """
+    plan_name: Optional[str] = None
+    plan_charge: Optional[float] = None
+    
+    # Extract plan name from "Plan:" label (strict)
+    for text_source in [rate_section, full_text]:
+        if not text_source:
+            continue
+            
+        plan_line = _extract_value_by_label(text_source, "Plan", max_len=250)
+        if plan_line:
+            # Stop at pricing fields - extract only the plan name part
+            name_part = re.split(
+                r"(Monthly Plan Charge|Monthly Rate Plan Charge|Minimum Monthly Charge)\s*:",
+                plan_line,
+                flags=re.IGNORECASE
+            )[0].strip()
+            
+            if name_part:
+                plan_name = _collapse_spaces(name_part)
+                break
+    
+    # Extract plan charge from "Monthly Plan Charge:" (strict)
+    charge_patterns = [
+        r"Monthly Plan Charge\s*:\s*\$?\s*([0-9.,]+)",
+        r"Monthly Rate Plan Charge\s*:\s*\$?\s*([0-9.,]+)"
+    ]
+    
+    for pattern in charge_patterns:
+        charge_raw = _first_group(pattern, full_text, flags=re.IGNORECASE)
+        if charge_raw:
+            plan_charge = _money_to_float(charge_raw)
+            break
+    
+    # Fallback to existing logic if strict extraction fails
+    if not plan_name or plan_charge is None:
+        fallback_name, fallback_charge = _pick_plan_name_and_charge(rate_section or "", full_text)
+        if not plan_name:
+            plan_name = fallback_name
+        if plan_charge is None:
+            plan_charge = fallback_charge
+    
+    return plan_name, plan_charge
+
+
+def _strict_extract_minimum_monthly_plan(full_text: str, plan_charge: Optional[float]) -> Optional[float]:
+    """
+    STRICT Rules:
+    1. If "Minimum Monthly Charge:" exists → use it
+    2. Else if prepaid/no commitment → use Monthly Plan Charge
+    3. Never leave null if charge exists
+    """
+    # Try "Minimum Monthly Charge:" first
+    min_charge = _money_to_float(_first_group(r"Minimum Monthly Charge\s*:\s*\$?\s*([0-9.,]+)", full_text, flags=re.IGNORECASE))
+    if min_charge is not None:
+        return min_charge
+    
+    # Try SmartPay format
+    smartpay_min = _money_to_float(
+        _first_group(
+            r"MINIMUM MONTHLY CHARGE\s*\(FOR DEVICE AND RATE PLAN\)\s*:\s*\$?\s*([0-9.,]+)",
+            full_text,
+            flags=re.IGNORECASE,
+        )
+    )
+    if smartpay_min is not None:
+        return smartpay_min
+    
+    # Check if it's prepaid/no commitment - use plan charge
+    if re.search(r"Commitment Period\s*:\s*No commitment", full_text, re.IGNORECASE):
+        return plan_charge
+    
+    # If we have a plan charge but no minimum, use plan charge
+    if plan_charge is not None:
+        return plan_charge
+    
+    return None
+
+
+def _strict_extract_device_imei(device_section: str, full_text: str) -> Optional[str]:
+    """
+    STRICT: Extract ONLY from "IMEI:" label.
+    Accept numeric 14-16 digits. Reject merged or overflow values.
+    """
+    for text_source in [device_section, full_text]:
+        if not text_source:
+            continue
+            
+        # Look for exact IMEI labels
+        imei_patterns = ["IMEI/ESN/MEID", "IMEI"]
+        for pattern in imei_patterns:
+            imei_chunk = _extract_value_by_label(text_source, pattern, max_len=200)
+            if imei_chunk:
+                # Extract only 14-16 digit sequences
+                digits = _digits_only(imei_chunk)
+                # Find valid IMEI length sequences
+                valid_imeis = re.findall(r'\d{14,16}', digits)
+                if valid_imeis:
+                    # Return the first valid IMEI (reject overflow)
+                    imei = valid_imeis[0]
+                    if len(imei) <= 16:  # Reject overflow like "11111111111111931202"
+                        return imei
+    
+    return None
+
+
+def _strict_extract_sim_number(device_section: str, full_text: str) -> Optional[str]:
+    """
+    STRICT: Extract from "SIM Number:" label.
+    Accept 19-20 digit numeric strings. Do not trim valid digits.
+    """
+    for text_source in [device_section, full_text]:
+        if not text_source:
+            continue
+            
+        sim_chunk = _extract_value_by_label(text_source, "SIM Number", max_len=250) or _extract_value_by_label(text_source, "SIM", max_len=250)
+        if sim_chunk:
+            # Extract 19-20 digit sequences (don't trim valid digits)
+            digits = _digits_only(sim_chunk)
+            # Look for valid SIM length sequences
+            valid_sims = re.findall(r'\d{19,20}', digits)
+            if valid_sims:
+                return valid_sims[0]  # Return first valid SIM
+    
+    return None
+
+
+def _strict_extract_addons_telecom(text: str) -> List[AddOn]:
+    """
+    STRICT: Extract items listed under "YOUR PLAN ADD-ONS:" section.
+    Also support existing formats for compatibility.
+    """
+    # Try strict "YOUR PLAN ADD-ONS:" first
+    addons_section = _extract_section(
+        text,
+        "YOUR PLAN ADD-ONS:",
+        [
+            "If you exceed", "Your Device Details", "Rate Plan Details", 
+            "TOTAL MONTHLY CHARGE", "ONE-TIME CHARGES", "CRITICAL INFORMATION SUMMARY",
+            "YOUR PROMOTIONS", "MINIMUM MONTHLY CHARGE"
+        ]
+    )
+    
+    # Fallback to existing formats for compatibility
+    if not addons_section:
+        addons_section = _extract_section(
+            text,
+            "YOUR RATE PLAN ADD-ONS:",
+            [
+                "If you exceed", "Your Device Details", "Rate Plan Details", 
+                "TOTAL MONTHLY CHARGE", "ONE-TIME CHARGES", "CRITICAL INFORMATION SUMMARY",
+                "YOUR PROMOTIONS", "MINIMUM MONTHLY CHARGE"
+            ]
+        )
+    
+    # Try "YOUR ADD-ON FEATURES" format
+    if not addons_section:
+        addons_section = _extract_section(
+            text,
+            "YOUR ADD-ON FEATURES",
+            [
+                "If you exceed", "Your Device Details", "Rate Plan Details", 
+                "TOTAL MONTHLY CHARGE", "ONE-TIME CHARGES", "CRITICAL INFORMATION SUMMARY",
+                "YOUR PROMOTIONS", "MINIMUM MONTHLY CHARGE"
+            ]
+        )
+    
+    if not addons_section:
+        return []
+    
+    addons = []
+    lines = addons_section.split('\n')
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+            
+        # Skip header-like lines
+        if re.search(r'^(YOUR PLAN ADD-ONS|YOUR RATE PLAN ADD-ONS|YOUR ADD-ON FEATURES|Add-ons|Monthly Charge)', line, re.IGNORECASE):
+            continue
+            
+        # Remove bullet points and clean up
+        clean_line = re.sub(r'^[•*\-\s]+', '', line).strip()
+        
+        # Pattern to match add-on name and price
+        price_pattern = r'(.+?)\s+(?:\$\s*)?(\d+(?:\.\d{2})?)\s*$'
+        match = re.search(price_pattern, clean_line)
+        
+        if match:
+            addon_name = match.group(1).strip()
+            price_str = match.group(2).strip()
+            
+            # Clean up addon name
+            addon_name = re.sub(r':\s*$', '', addon_name).strip()
+            
+            if len(addon_name) >= 3:
+                try:
+                    price = float(price_str)
+                    if price > 0:
+                        addons.append(AddOn(name=addon_name, monthly_charge=price))
+                except ValueError:
+                    continue
+        else:
+            # Skip free/included items
+            if re.search(r'(included|free|\$\s*0\.00)', clean_line, re.IGNORECASE):
+                continue
+    
+    return addons
+    """
     Dynamic rules for customer identifier:
     Priority:
     1) Customer Name
-    2) Company Name
-    3) Customer ID  (your sp_contract_print_out expects an ID-style value)
-    4) Account Number
+    2) Member Name (for newer format documents)
+    3) Company Name
+    4) Customer ID  (your sp_contract_print_out expects an ID-style value)
+    5) Account Number
     """
-    for label in ["Customer Name", "Company Name", "Customer ID", "Account Number"]:
+    for label in ["Customer Name", "Member Name", "Company Name", "Customer ID", "Account Number"]:
         v = _extract_value_by_label(info_section, label)
         v = _collapse_spaces(v)
         if v:
@@ -270,43 +553,181 @@ def _pick_plan_name_and_charge(rate_section: str, full_text: str) -> Tuple[Optio
     return plan_name, plan_charge
 
 
+def _extract_addons(text: str) -> List[AddOn]:
+    """
+    Extract add-ons from "YOUR RATE PLAN ADD-ONS:" or "YOUR ADD-ON FEATURES" section.
+    Only include add-ons with price > 0.
+    Handle multi-column and bullet layouts safely.
+    Stop parsing when next section starts.
+    """
+    # Try "YOUR RATE PLAN ADD-ONS:" first
+    addons_section = _extract_section(
+        text,
+        "YOUR RATE PLAN ADD-ONS:",
+        [
+            "If you exceed", "Your Device Details", "Rate Plan Details", 
+            "TOTAL MONTHLY CHARGE", "ONE-TIME CHARGES", "CRITICAL INFORMATION SUMMARY",
+            "YOUR PROMOTIONS", "MINIMUM MONTHLY CHARGE"
+        ]
+    )
+    
+    # If not found, try "YOUR ADD-ON FEATURES" format
+    if not addons_section:
+        addons_section = _extract_section(
+            text,
+            "YOUR ADD-ON FEATURES",
+            [
+                "If you exceed", "Your Device Details", "Rate Plan Details", 
+                "TOTAL MONTHLY CHARGE", "ONE-TIME CHARGES", "CRITICAL INFORMATION SUMMARY",
+                "YOUR PROMOTIONS", "MINIMUM MONTHLY CHARGE"
+            ]
+        )
+    
+    if not addons_section:
+        return []
+    
+    addons = []
+    
+    # Split into lines and process each line
+    lines = addons_section.split('\n')
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+            
+        # Skip header-like lines
+        if re.search(r'^(YOUR RATE PLAN ADD-ONS|YOUR ADD-ON FEATURES|Add-ons|Monthly Charge)', line, re.IGNORECASE):
+            continue
+            
+        # Look for add-on pattern: name followed by price
+        # Handle various formats like:
+        # • Add-on Name $10.00
+        # Add-on Name: $14.00
+        # Add-on Name $0.00
+        # Add-on Name Included
+        
+        # Remove bullet points and clean up
+        clean_line = re.sub(r'^[•*\-\s]+', '', line).strip()
+        
+        # Pattern to match add-on name and price
+        # Captures everything before the last price-like pattern on the line
+        price_pattern = r'(.+?)\s+(?:\$\s*)?(\d+(?:\.\d{2})?)\s*$'
+        match = re.search(price_pattern, clean_line)
+        
+        if match:
+            addon_name = match.group(1).strip()
+            price_str = match.group(2).strip()
+            
+            # Clean up addon name - remove trailing colons, extra spaces
+            addon_name = re.sub(r':\s*$', '', addon_name).strip()
+            
+            # Skip if name is too short or looks like a header
+            if len(addon_name) < 3:
+                continue
+                
+            try:
+                price = float(price_str)
+                
+                # Only include add-ons with price > 0
+                if price > 0:
+                    addons.append(AddOn(name=addon_name, monthly_charge=price))
+                    
+            except ValueError:
+                # Skip if price can't be parsed
+                continue
+        else:
+            # Check for "Included" or "$0.00" patterns and skip them
+            if re.search(r'(included|free|\$\s*0\.00)', clean_line, re.IGNORECASE):
+                continue
+    
+    return addons
+
+
 # ---------------- Parsing ----------------
 def parse_contract_text(full_text: str) -> ContractExtraction:
     text = _norm_text(full_text)
 
     # Targeted sections (prevents Store Phone Number bleeding into customer phone)
+    # Try both "YOUR INFORMATION:" and "YOUR INFO" formats
     info_section = _extract_section(
         text,
         "YOUR INFORMATION:",
         ["YOUR DEVICE DETAILS:", "YOUR DEVICE DETAILS", "YOUR RATE PLAN DETAILS:", "CRITICAL INFORMATION SUMMARY"]
     )
+    
+    # If not found, try "YOUR INFO" format
+    if not info_section:
+        info_section = _extract_section(
+            text,
+            "YOUR INFO",
+            ["YOUR DEVICE INFO", "YOUR DEVICE DETAILS:", "YOUR PLAN INFO", "YOUR RATE PLAN DETAILS:", "CRITICAL INFORMATION SUMMARY"]
+        )
 
+    # Try both "YOUR DEVICE DETAILS:" and "YOUR DEVICE INFO" formats
     device_section = _extract_section(
         text,
         "YOUR DEVICE DETAILS:",
         ["YOUR RATE PLAN DETAILS:", "YOUR RATE PLAN DETAILS", "MINIMUM MONTHLY CHARGE", "TOTAL MONTHLY CHARGE"]
     )
+    
+    # If not found, try "YOUR DEVICE INFO" format
+    if not device_section:
+        device_section = _extract_section(
+            text,
+            "YOUR DEVICE INFO",
+            ["YOUR PLAN INFO", "YOUR RATE PLAN DETAILS:", "MINIMUM MONTHLY CHARGE", "TOTAL MONTHLY CHARGE"]
+        )
 
+    # Try both "YOUR RATE PLAN DETAILS:" and "YOUR PLAN INFO" formats
     rate_section = _extract_section(
         text,
         "YOUR RATE PLAN DETAILS:",
         ["YOUR RATE PLAN ADD-ONS:", "YOUR PROMOTIONS:", "TOTAL MONTHLY CHARGE:", "ONE-TIME CHARGES:"]
     )
+    
+    # If not found, try "YOUR PLAN INFO" format
+    if not rate_section:
+        rate_section = _extract_section(
+            text,
+            "YOUR PLAN INFO",
+            ["YOUR RATE PLAN ADD-ONS:", "YOUR PROMOTIONS:", "TOTAL MONTHLY CHARGE:", "ONE-TIME CHARGES:"]
+        )
 
-    # --- Customer Name (Customer Name OR Company Name OR Customer ID) ---
-    customer_name = _pick_customer_name(info_section or text)
+    # --- Customer Name (STRICT: Customer Name label only) ---
+    customer_name = _strict_extract_customer_name(info_section, text)
 
-    # --- Customer Phone (from YOUR INFORMATION only) ---
-    raw_phone_line = _extract_value_by_label(info_section or text, "Phone Number") or _extract_value_by_label(info_section or text, "Phone")
+    # --- Customer Phone (from YOUR INFO/INFORMATION section only, avoid store phone) ---
+    # First try to get phone from the info section specifically
+    raw_phone_line = None
+    if info_section:
+        raw_phone_line = _extract_value_by_label(info_section, "Phone Number") or _extract_value_by_label(info_section, "Phone")
+    
+    # If not found in info section, try the full text but be more careful
+    if not raw_phone_line:
+        # Look for phone number but exclude store phone numbers
+        phone_matches = re.findall(r"Phone Number\s*:\s*([^\n]+)", text, re.IGNORECASE)
+        for phone_match in phone_matches:
+            # Skip if it's clearly a store phone (contains "Store" nearby)
+            context_before = text[max(0, text.find(phone_match) - 100):text.find(phone_match)]
+            if not re.search(r"store", context_before, re.IGNORECASE):
+                raw_phone_line = phone_match
+                break
+    
     customer_phone = _extract_phone_from_chunk(raw_phone_line or "") if raw_phone_line else None
 
     # --- Customer Address (multi-line) ---
-    # stop labels are the next fields typically following Address in YOUR INFORMATION
+    # stop labels are the next fields typically following Address in YOUR INFORMATION/INFO
     customer_address = _extract_block_after_label(
         info_section or text,
         "Address",
-        ["Monthly Payment Method", "First Bill Date", "User Name", "Account Number", "Phone Number", "Default Voicemail Password", "Customer ID"]
+        ["Monthly Payment Method", "First Bill Date", "User Name", "Account Number", "Phone Number", "Default Voicemail Password", "Customer ID", "YOUR DEVICE INFO", "YOUR DEVICE DETAILS"]
     )
+    
+    # Clean up address if it contains section headers
+    if customer_address:
+        # Remove any section headers that might have been included
+        customer_address = re.sub(r'\s*(YOUR DEVICE INFO|YOUR DEVICE DETAILS).*$', '', customer_address, flags=re.IGNORECASE).strip()
 
     # --- Order Number / Activity (from Critical Info area; safe on whole text) ---
     order_number = _extract_value_by_label(text, "Order Number")
@@ -315,31 +736,26 @@ def parse_contract_text(full_text: str) -> ContractExtraction:
         order_number = re.split(r"\b(Store|Date|Activity)\s*:", order_number, flags=re.IGNORECASE)[0].strip()
     order_number = _collapse_spaces(order_number)
 
-    activity = _extract_value_by_label(text, "Activity")
-    if activity:
-        activity = re.split(r"\b(Store Phone Number|Store|Date)\s*:", activity, flags=re.IGNORECASE)[0].strip()
-    activity = _collapse_spaces(activity)
+    # --- Activity (STRICT: Activity label only) ---
+    activity = _strict_extract_activity(text)
 
-    # --- Dates (robust label->date extractor) ---
+    # --- Dates (robust label->date extractor with No commitment handling) ---
     # Prefer within device section first (often has Commitment Period block),
     # fallback to whole text.
     contract_start = _extract_labeled_date(device_section or text, "Start Date") or _extract_labeled_date(text, "Start Date")
     contract_end = _extract_labeled_date(device_section or text, "End Date") or _extract_labeled_date(text, "End Date")
+    
+    # STRICT: If "Commitment Period: No commitment" then contract_end_date should be null
+    if re.search(r"Commitment Period\s*:\s*No commitment", text, re.IGNORECASE):
+        contract_end = None
 
-    # --- Plan name & plan charge ---
-    plan_name, plan_charge = _pick_plan_name_and_charge(rate_section or text, text)
+    # --- Plan name & plan charge (STRICT: Plan and Monthly Plan Charge labels) ---
+    plan_name, plan_charge = _strict_extract_plan_name_and_charge(rate_section, text)
 
-    # --- Minimum Monthly Plan (SmartPay docs) ---
-    minimum_monthly_plan = _money_to_float(
-        _first_group(
-            r"MINIMUM MONTHLY CHARGE\s*\(FOR DEVICE AND RATE PLAN\)\s*:\s*\$?\s*([0-9.,]+)",
-            text,
-            flags=re.IGNORECASE,
-        )
-    )
+    # --- Minimum Monthly Plan (STRICT: Rules-based extraction) ---
+    minimum_monthly_plan = _strict_extract_minimum_monthly_plan(text, plan_charge)
 
-    # If plan_charge still missing:
-    # BYOD commonly has "Minimum Monthly Charge: $85.00" elsewhere
+    # If plan_charge still missing, try fallback patterns
     if plan_charge is None:
         byod_min = _money_to_float(_first_group(r"Minimum Monthly Charge\s*:\s*\$?\s*([0-9.,]+)", text, flags=re.IGNORECASE))
         if byod_min is not None:
@@ -350,18 +766,25 @@ def parse_contract_text(full_text: str) -> ContractExtraction:
             if mrc is not None:
                 plan_charge = mrc
 
-    # --- Device model / IMEI / SIM ---
+    # --- Device model / IMEI / Serial Number / SIM (STRICT extraction) ---
     model_raw = _extract_value_by_label(device_section or text, "Model", max_len=200)
     if model_raw:
         # cut if OCR merged "Early Cancellation Fee(s)" etc
-        model_raw = re.split(r"\b(Early Cancellation Fee|IMEI/ESN/MEID|SIM Number|Commitment Period|Start Date|End Date)\b", model_raw, flags=re.IGNORECASE)[0].strip()
+        model_raw = re.split(r"\b(Early Cancellation Fee|IMEI/ESN/MEID|Serial Number|SIM Number|Commitment Period|Start Date|End Date)\b", model_raw, flags=re.IGNORECASE)[0].strip()
     device_model = _collapse_spaces(model_raw)
 
-    imei_chunk = _extract_value_by_label(device_section or text, "IMEI/ESN/MEID", max_len=200) or _extract_value_by_label(device_section or text, "IMEI", max_len=200)
-    device_imei = _extract_long_digit_run(imei_chunk, min_len=10, max_len=20)
+    # IMEI extraction (STRICT: 14-16 digits only)
+    device_imei = _strict_extract_device_imei(device_section, text)
 
-    sim_chunk = _extract_value_by_label(device_section or text, "SIM Number", max_len=250) or _extract_value_by_label(device_section or text, "SIM", max_len=250)
-    sim_number = _extract_long_digit_run(sim_chunk, min_len=18, max_len=22)
+    # Serial Number extraction (separate from IMEI)
+    serial_chunk = _extract_value_by_label(device_section or text, "Serial Number", max_len=200)
+    serial_number = _extract_long_digit_run(serial_chunk, min_len=10, max_len=20)
+
+    # SIM Number extraction (STRICT: 19-20 digits, don't trim)
+    sim_number = _strict_extract_sim_number(device_section, text)
+
+    # --- Add-ons extraction (STRICT: YOUR PLAN ADD-ONS support) ---
+    add_ons = _strict_extract_addons_telecom(text)
 
     return ContractExtraction(
         customer_name=customer_name,
@@ -377,7 +800,9 @@ def parse_contract_text(full_text: str) -> ContractExtraction:
         down_payment=None,
         device_model=device_model,
         device_imei=device_imei,
+        serial_number=serial_number,
         sim_number=sim_number,
+        add_ons=add_ons,
         raw_text=full_text,
     )
 

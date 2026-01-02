@@ -1,7 +1,12 @@
 # app/models.py
 from datetime import date
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
+
+
+class AddOn(BaseModel):
+    name: str
+    monthly_charge: float
 
 
 class ContractExtraction(BaseModel):
@@ -23,7 +28,10 @@ class ContractExtraction(BaseModel):
 
     device_model: Optional[str] = None
     device_imei: Optional[str] = None
+    serial_number: Optional[str] = None
     sim_number: Optional[str] = None
+
+    add_ons: List[AddOn] = []
 
     # For debugging
     raw_text: Optional[str] = None
