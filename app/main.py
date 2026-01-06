@@ -18,6 +18,7 @@ def health_check():
 
 @app.post("/extract", response_model=ExtractResponse)
 async def extract_contract(file: UploadFile = File(...)):
+  
     # Basic validation
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")

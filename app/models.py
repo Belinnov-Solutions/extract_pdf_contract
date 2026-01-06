@@ -33,9 +33,6 @@ class ContractExtraction(BaseModel):
 
     add_ons: List[AddOn] = []
 
-    # For debugging
-    raw_text: Optional[str] = None
-
 
 class ExtractResponse(BaseModel):
     success: bool
